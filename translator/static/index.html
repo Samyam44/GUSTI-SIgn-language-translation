@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>GUSTI - Sign Language Translator</title>
+<style>
+    /* ===== Reset ===== */
+    * { margin:0; padding:0; box-sizing:border-box; }
+    html, body { height:100%; width:100%; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif; }
+    body { display:flex; justify-content:center; align-items:flex-start; background: linear-gradient(to bottom right, #fef3c7, #fed7aa, #ffe4e6); padding:1rem; }
+
+    /* ===== Container ===== */
+    .container { display:flex; flex-direction: column; width:100%; max-width:1536px; gap:1.5rem; }
+
+    /* ===== Header ===== */
+    .header { text-align:center; }
+    .header h1 { font-size:2rem; color:#312e81; }
+    .header p { color:#4338ca; font-size:1rem; }
+
+    /* ===== Main Grid ===== */
+    .main-grid { display:flex; flex-wrap:wrap; gap:1rem; justify-content:stretch; }
+
+    .card { background:white; border-radius:1rem; padding:1rem; flex:1 1 400px; display:flex; flex-direction:column; }
+    .card-title { font-weight:bold; color:#312e81; margin-bottom:0.5rem; display:flex; align-items:center; justify-content:space-between; }
+
+    /* ===== Video ===== */
+    .camera-display { position:relative; width:100%; aspect-ratio:16/9; background:#e0e7ff; border-radius:1rem; overflow:hidden; display:flex; justify-content:center; align-items:center; }
+    #cameraFeed { width:100%; height:100%; object-fit:cover; }
+
+    /* Overlay text */
+    #overlayText { position:absolute; bottom:0.5rem; left:50%; transform:translateX(-50%); background: rgba(0,0,0,0.5); color:white; font-size:1rem; padding:0.25rem 0.5rem; border-radius:0.5rem; text-align:center; }
+
+    /* Detected text boxes */
+    .text-display { background:linear-gradient(to bottom right,#ffedd5,#fef3c7); border-radius:1rem; padding:0.5rem; min-height:3rem; display:flex; align-items:center; justify-content:center; }
+    .text-content { font-size:1rem; color:#312e81; font-weight:500; }
+    .text-placeholder { font-size:0.9rem; color:#c7d2fe; font-style:italic; }
+
+    /* Buttons */
+    .btn { padding:0.5rem 1rem; border-radius:0.75rem; font-weight:600; border:none; cursor:pointer; transition:all 0.2s; }
+    .btn-primary { background:#4338ca; color:white; }
+    .btn-primary:hover { background:#3730a3; }
+    .btn-danger { background:#ef4444; color:white; }
+    .btn-danger:hover { background:#dc2626; }
+
+    /* Responsive adjustments */
+    @media(max-width:900px){ .main-grid{flex-direction:column;} }
+</style>
+</head>
+<body>
+<div class="container">
+    <div class="header">
+        <h1>GUSTI</h1>
+        <p>Gesture Understanding and Sign Translation Initiative</p>
+    </div>
+
+    <div class="main-grid">
+        <!-- Left Column: Video + Detection -->
+        <div class="card">
+            <div class="card-title">
+                Camera Feed
+                <button class="btn btn-primary" id="toggleBtn">Start Detection</button>
+            </div>
+            <div class="camera-display">
+                <img id="cameraFeed" src="" alt="Camera feed">
+                <div id="overlayText"></div>
+            </div>
+            <div class="card-title">Detected Text (English)</div>
+            <div class="text-display">
+                <p id="detectedText" class="text-placeholder">Detected text will appear here...</p>
+            </div>
+            <div class="card-title">Translated Text</div>
+            <div class="text-display">
+                <p id="translatedText" class="text-placeholder">Translation will appear here...</p>
+            </div>
+        </div>
+
+        <!-- Right Column: Controls -->
+        <div class="card">
+            <div class="card-title">Output Language</div>
+            <select id="languageSelect" style="padding:0.5rem; width:100%; border-radius:0.5rem; border:1px solid #c7d2fe;">
+                <option value="en">English</option>
+                <option value="es">Spanish</option>
+                <option value="fr">French</option>
+                <option value="de">German</option>
+                <option value="it">Italian</option>
+                <option value="pt">Portuguese</option>
+                <option value="zh-cn">Chinese</option>
+                <option value="ja">Japanese</option>
+                <option value="ko">Korean</option>
+                <option value="hi">Hindi</option>
+            </select>
+        </div>
+    </div>
+</div>
+
+<script>
+let detecting = false;
+let lastSentence = "";
+const toggleBtn = document.getElementById('toggleBtn');
+const detectedTextEl = document.getElementById('detectedText');
+const translatedTextEl = document.getElementById('translatedText');
+const overlayEl = document.getElementById('overlayText');
+const languageSelect = document.getElementById('languageSelect');
+
+toggleBtn.addEventListener('click', async () => {
+    detecting = !detecting;
+    toggleBtn.textContent = detecting ? "Stop Detection" : "Start Detection";
+    toggleBtn.className = detecting ? "btn btn-danger" : "btn btn-primary";
+
+    // Notify backend
+    await fetch('/toggle_detection', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({active: detecting})
+    });
+});
+
+// Live video feed
+document.getElementById('cameraFeed').src = '/video_feed';
+
+// Poll for latest translation
+setInterval(async () => {
+    if (!detecting) return;
+    try {
+        const resp = await fetch('/get_translation');
+        const data = await resp.json();
+        if (data.sentence) {
+            detectedTextEl.textContent = data.sentence;
+            detectedTextEl.className = "text-content";
+            overlayEl.textContent = data.sentence;
+            overlayEl.style.opacity = 1;
+        } else {
+            detectedTextEl.textContent = "Detected text will appear here...";
+            detectedTextEl.className = "text-placeholder";
+            overlayEl.style.opacity = 0;
+        }
+
+        if (data.translation) {
+            translatedTextEl.textContent = data.translation;
+            translatedTextEl.className = "text-content";
+        } else {
+            translatedTextEl.textContent = "Translation will appear here...";
+            translatedTextEl.className = "text-placeholder";
+        }
+
+        // Auto-play audio if sentence changed
+        if (data.audio_base64 && data.sentence !== lastSentence) {
+            lastSentence = data.sentence;
+            const audio = new Audio("data:audio/mp3;base64," + data.audio_base64);
+            audio.play();
+        }
+
+    } catch (e) {
+        console.error(e);
+    }
+}, 500);
+
+</script>
+</body>
+</html>
