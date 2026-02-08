@@ -1,154 +1,204 @@
 """
-Translation and Text-to-Speech Module
-Provides translation and TTS capabilities for ASL recognition output.
+Translation and Text-to-Speech module for ASL demo.
+Handles Google Translate API and gTTS for speech output.
 """
 
-from typing import Optional
-import logging
+import os
 from gtts import gTTS
 from googletrans import Translator
 import io
+import base64
+from typing import Optional, Tuple
+import tempfile
 
-logger = logging.getLogger(__name__)
 
-
-class TranslationTTS:
+class TranslationTTSEngine:
     """
-    Handles translation and text-to-speech conversion.
-    Uses Google Translate API and Google Text-to-Speech.
+    Translation and Text-to-Speech engine.
     """
     
-    def __init__(self):
-        """Initialize the translation and TTS service."""
-        self.translator = Translator()
-        logger.info("Translation/TTS service initialized")
-    
-    def translate(self, text: str, target_language: str = 'es', source_language: str = 'en') -> str:
+    def __init__(self, config: dict):
         """
-        Translate text from source language to target language.
+        Initialize translation and TTS engine.
+        
+        Args:
+            config: Configuration dictionary
+        """
+        self.config = config
+        self.translator = Translator()
+        
+        # Cache for audio files to avoid regenerating
+        self.audio_cache = {}
+        self.cache_max_size = 50
+        
+        # Statistics
+        self.total_translations = 0
+        self.total_tts_generations = 0
+    
+    def translate(self, text: str, target_lang: str = 'es') -> Tuple[str, str]:
+        """
+        Translate text to target language.
         
         Args:
             text: Text to translate
-            target_language: Target language code (ISO 639-1)
-            source_language: Source language code (default: 'en' for English)
-            
-        Returns:
-            Translated text, or original text if translation fails
-        """
-        if not text or not text.strip():
-            return ""
+            target_lang: Target language code (e.g., 'es', 'fr')
         
-        # If target is English, no translation needed
-        if target_language == 'en':
-            return text
+        Returns:
+            (translated_text, detected_source_lang)
+        """
+        if not text or not self.config['translation']['enabled']:
+            return text, 'en'
         
         try:
-            translation = self.translator.translate(
-                text,
-                src=source_language,
-                dest=target_language
+            result = self.translator.translate(text, dest=target_lang)
+            self.total_translations += 1
+            return result.text, result.src
+        except Exception as e:
+            print(f"Translation error: {e}")
+            return text, 'en'
+    
+    def text_to_speech(self, text: str, lang: str = 'en', 
+                       return_base64: bool = True) -> Optional[str]:
+        """
+        Convert text to speech using gTTS.
+        
+        Args:
+            text: Text to convert
+            lang: Language code
+            return_base64: If True, return base64 encoded audio
+        
+        Returns:
+            Base64 encoded MP3 audio or file path
+        """
+        if not text or not self.config['tts']['enabled']:
+            return None
+        
+        # Check cache
+        cache_key = f"{text}_{lang}"
+        if cache_key in self.audio_cache:
+            return self.audio_cache[cache_key]
+        
+        try:
+            # Generate speech
+            tts = gTTS(
+                text=text,
+                lang=lang,
+                slow=self.config['tts']['slow']
             )
             
-            if translation and translation.text:
-                logger.debug(f"Translated '{text}' to '{translation.text}'")
-                return translation.text
-            else:
-                logger.warning(f"Translation returned empty result for: {text}")
-                return text
+            if return_base64:
+                # Save to bytes buffer
+                mp3_fp = io.BytesIO()
+                tts.write_to_fp(mp3_fp)
+                mp3_fp.seek(0)
                 
-        except Exception as e:
-            logger.error(f"Translation error: {e}")
-            return text
-    
-    def text_to_speech(self, text: str, language: str = 'es') -> Optional[bytes]:
-        """
-        Convert text to speech audio.
+                # Encode to base64
+                audio_base64 = base64.b64encode(mp3_fp.read()).decode('utf-8')
+                
+                # Cache result
+                if len(self.audio_cache) < self.cache_max_size:
+                    self.audio_cache[cache_key] = audio_base64
+                
+                self.total_tts_generations += 1
+                return audio_base64
+            else:
+                # Save to temporary file
+                with tempfile.NamedTemporaryFile(delete=False, suffix='.mp3') as fp:
+                    tts.save(fp.name)
+                    self.total_tts_generations += 1
+                    return fp.name
         
-        Args:
-            text: Text to convert to speech
-            language: Language code for TTS (ISO 639-1)
-            
-        Returns:
-            MP3 audio data as bytes, or None if conversion fails
-        """
-        if not text or not text.strip():
-            return None
-        
-        try:
-            # Create TTS object
-            tts = gTTS(text=text, lang=language, slow=False)
-            
-            # Save to bytes buffer
-            audio_buffer = io.BytesIO()
-            tts.write_to_fp(audio_buffer)
-            audio_buffer.seek(0)
-            
-            audio_data = audio_buffer.read()
-            logger.debug(f"Generated TTS audio for: {text[:50]}...")
-            
-            return audio_data
-            
         except Exception as e:
-            logger.error(f"TTS error: {e}")
+            print(f"TTS error: {e}")
             return None
     
-    def translate_and_speak(self, text: str, target_language: str = 'es') -> tuple[str, Optional[bytes]]:
+    def process_sentence(self, sentence: str, target_lang: str = 'es'
+                        ) -> Tuple[str, Optional[str], Optional[str]]:
         """
-        Translate text and generate speech for the translation.
+        Complete processing: translate and generate speech.
         
         Args:
-            text: Text to translate and speak
-            target_language: Target language code
-            
+            sentence: Input sentence
+            target_lang: Target language for translation
+        
         Returns:
-            Tuple of (translated_text, audio_data)
+            (translated_text, original_audio_base64, translated_audio_base64)
         """
+        if not sentence:
+            return "", None, None
+        
         # Translate
-        translated = self.translate(text, target_language=target_language)
+        translated, src_lang = self.translate(sentence, target_lang)
         
-        # Generate speech
-        audio = self.text_to_speech(translated, language=target_language)
+        # Generate TTS for original (English)
+        original_audio = self.text_to_speech(sentence, lang='en')
         
-        return translated, audio
+        # Generate TTS for translation
+        translated_audio = self.text_to_speech(translated, lang=target_lang)
+        
+        return translated, original_audio, translated_audio
     
-    def cleanup(self):
-        """Cleanup resources (placeholder for future extensions)."""
-        logger.info("Translation/TTS cleanup complete")
-
-
-# Language code mappings (for reference)
-LANGUAGE_CODES = {
-    'en': 'English',
-    'es': 'Spanish',
-    'fr': 'French',
-    'de': 'German',
-    'it': 'Italian',
-    'pt': 'Portuguese',
-    'ja': 'Japanese',
-    'zh-CN': 'Chinese (Simplified)',
-    'zh-TW': 'Chinese (Traditional)',
-    'ko': 'Korean',
-    'ar': 'Arabic',
-    'ru': 'Russian',
-    'hi': 'Hindi',
-    'tr': 'Turkish',
-    'nl': 'Dutch',
-    'pl': 'Polish',
-    'sv': 'Swedish',
-    'da': 'Danish',
-    'fi': 'Finnish',
-    'no': 'Norwegian'
-}
-
-
-def get_language_name(code: str) -> str:
-    """
-    Get language name from code.
+    def clear_cache(self):
+        """Clear audio cache."""
+        self.audio_cache.clear()
     
-    Args:
-        code: ISO 639-1 language code
-        
-    Returns:
-        Language name or the code if not found
-    """
-    return LANGUAGE_CODES.get(code, code)
+    def get_stats(self) -> dict:
+        """Get engine statistics."""
+        return {
+            'total_translations': self.total_translations,
+            'total_tts_generations': self.total_tts_generations,
+            'cache_size': len(self.audio_cache)
+        }
+
+
+def test_translation_tts():
+    """Test translation and TTS functionality."""
+    print("Testing Translation & TTS Engine...")
+    print("=" * 60)
+    
+    config = {
+        'translation': {'enabled': True},
+        'tts': {'enabled': True, 'slow': False}
+    }
+    
+    engine = TranslationTTSEngine(config)
+    
+    # Test translation
+    print("\n1. Testing translation...")
+    text = "hello world"
+    
+    for lang, name in [('es', 'Spanish'), ('fr', 'French'), ('de', 'German')]:
+        translated, src = engine.translate(text, lang)
+        print(f"  {name}: {translated}")
+    
+    # Test TTS
+    print("\n2. Testing TTS...")
+    audio = engine.text_to_speech("hello world", lang='en')
+    
+    if audio:
+        print(f"  ✓ Generated audio (base64 length: {len(audio)})")
+    else:
+        print("  ✗ TTS failed")
+    
+    # Test full pipeline
+    print("\n3. Testing full pipeline...")
+    translated, orig_audio, trans_audio = engine.process_sentence(
+        "hello world", target_lang='es'
+    )
+    
+    print(f"  Translated: {translated}")
+    print(f"  Original audio: {'✓' if orig_audio else '✗'}")
+    print(f"  Translated audio: {'✓' if trans_audio else '✗'}")
+    
+    # Statistics
+    print("\n4. Statistics:")
+    stats = engine.get_stats()
+    for key, value in stats.items():
+        print(f"  {key}: {value}")
+    
+    print("\n" + "=" * 60)
+    print("All tests completed!")
+
+
+if __name__ == "__main__":
+    test_translation_tts()

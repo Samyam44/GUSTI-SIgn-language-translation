@@ -1,283 +1,512 @@
 """
-Realtime ASL Recognition Engines
-Provides both sentence-level and alphabet-level ASL recognition.
+Real-time ASL recognition engine with webcam processing,
+buffering, and sentence building logic.
 """
 
-import cv2
 import numpy as np
+import cv2
 import mediapipe as mp
-from typing import List, Tuple, Optional
+from mediapipe.tasks import python
+from mediapipe.tasks.python import vision
+from collections import deque
+import time
+from typing import Optional, Tuple, List
 import tensorflow as tf
+from tensorflow import keras
+
+from utils import load_char_map
+from model import greedy_decode
+
+
+def load_model_with_custom_objects(model_path: str) -> keras.Model:
+    """
+    Load ASL model with proper handling of custom TensorFlow operations.
+    
+    This function tries multiple strategies to load the model:
+    1. Load with custom objects
+    2. Load weights only if model has complex custom layers
+    
+    Args:
+        model_path: Path to the .h5 model file
+        
+    Returns:
+        Loaded Keras model
+    """
+    print(f"Attempting to load model from: {model_path}")
+    
+    # Strategy 1: Try loading weights only (most reliable for models with custom ops)
+    try:
+        print("Strategy: Building model architecture and loading weights...")
+        from model import build_ctc_model
+        
+        # Build fresh model with standard architecture
+        model = build_ctc_model(
+            input_dim=258,      # Hand + pose keypoints
+            lstm_units=128,
+            num_layers=2,
+            dropout=0.3,
+            num_classes=28,
+            dense_units=128
+        )
+        
+        # Load only the weights (bypasses custom layer issues)
+        model.load_weights(model_path)
+        print(f"✓ Model architecture built and weights loaded successfully")
+        return model
+        
+    except Exception as e1:
+        print(f"⚠ Could not load weights: {e1}")
+        print("Trying alternative strategy...")
+    
+    # Strategy 2: Try loading full model with custom objects
+    try:
+        print("Strategy: Loading full model with custom objects...")
+        
+        # Create wrapper classes for TensorFlow operations
+        class NotEqualLayer(keras.layers.Layer):
+            def call(self, inputs):
+                return tf.math.not_equal(inputs[0], inputs[1])
+        
+        class EqualLayer(keras.layers.Layer):
+            def call(self, inputs):
+                return tf.math.equal(inputs[0], inputs[1])
+        
+        custom_objects = {
+            'NotEqual': NotEqualLayer,
+            'Equal': EqualLayer,
+            'ReduceAny': lambda: tf.reduce_any,
+            'ReduceAll': lambda: tf.reduce_all,
+        }
+        
+        model = keras.models.load_model(
+            model_path,
+            custom_objects=custom_objects,
+            compile=False
+        )
+        print(f"✓ Model loaded with custom objects")
+        return model
+        
+    except Exception as e2:
+        print(f"✗ Failed to load model: {e2}")
+        raise RuntimeError(f"Could not load model from {model_path}. Error: {e2}")
 
 
 class RealtimeASLEngine:
     """
-    Sentence-level ASL recognition engine.
-    Recognizes complete ASL phrases and sentences.
+    Real-time ASL sentence recognition engine.
+    Handles webcam input, keypoint extraction, buffering, and prediction.
     """
     
-    def __init__(self, model_path: str, labels_path: str, confidence_threshold: float = 0.6):
+    def __init__(self, config: dict, model_path: str, char_map_path: str):
         """
-        Initialize the sentence-level ASL recognition engine.
+        Initialize real-time engine.
         
         Args:
-            model_path: Path to the trained TensorFlow model (.h5 file)
-            labels_path: Path to the labels file (.txt file)
-            confidence_threshold: Minimum confidence threshold for predictions
+            config: Configuration dictionary
+            model_path: Path to trained model
+            char_map_path: Path to character mapping
         """
-        self.confidence_threshold = confidence_threshold
-        self.model = None
-        self.labels = []
+        self.config = config
         
-        # Initialize MediaPipe Hands
-        self.mp_hands = mp.solutions.hands
-        self.hands = self.mp_hands.Hands(
-            static_image_mode=False,
-            max_num_hands=2,
-            min_detection_confidence=0.5,
-            min_tracking_confidence=0.5
+        # Load model with custom objects handling
+        print("Loading ASL recognition model...")
+        self.model = load_model_with_custom_objects(model_path)
+        
+        # Load character mapping
+        self.char_to_idx, self.idx_to_char = load_char_map(char_map_path)
+        self.blank_index = len(self.char_to_idx) - 1
+        
+        # Initialize MediaPipe
+        self._init_mediapipe()
+        
+        # Keypoint buffer for temporal context
+        self.keypoint_buffer = deque(
+            maxlen=config['processing']['buffer_size']
         )
-        self.mp_draw = mp.solutions.drawing_utils
         
-        # Load model and labels
-        self._load_model(model_path)
-        self._load_labels(labels_path)
-    
-    def _load_model(self, model_path: str):
-        """Load the TensorFlow model."""
+        # Sentence building
+        self.current_sentence = []
+        self.last_prediction = ""
+        self.stable_prediction_count = 0
+        self.pause_counter = 0
+        
+        # Performance tracking
+        self.fps = 0
+        self.frame_count = 0
+        self.start_time = time.time()
+        
+        # Statistics
+        self.total_predictions = 0
+        self.processing_times = deque(maxlen=30)
+        
+    def _init_mediapipe(self):
+        """Initialize MediaPipe landmarkers."""
+        print("Initializing MediaPipe...")
+        
+        # Hand landmarker
+        hand_options = vision.HandLandmarkerOptions(
+            base_options=python.BaseOptions(
+                model_asset_path='hand_landmarker.task'
+            ),
+            num_hands=2,
+            min_hand_detection_confidence=self.config['mediapipe']['hand_detection_confidence'],
+            min_hand_presence_confidence=self.config['mediapipe']['hand_detection_confidence'],
+            min_tracking_confidence=self.config['mediapipe']['hand_tracking_confidence']
+        )
+        
+        # Pose landmarker
+        pose_options = vision.PoseLandmarkerOptions(
+            base_options=python.BaseOptions(
+                model_asset_path='pose_landmarker_full.task'
+            ),
+            min_pose_detection_confidence=self.config['mediapipe']['pose_detection_confidence'],
+            min_pose_presence_confidence=self.config['mediapipe']['pose_detection_confidence'],
+            min_tracking_confidence=self.config['mediapipe']['pose_tracking_confidence']
+        )
+        
         try:
-            self.model = tf.keras.models.load_model(model_path)
-            print(f"Sentence model loaded from {model_path}")
+            self.hand_landmarker = vision.HandLandmarker.create_from_options(hand_options)
+            self.pose_landmarker = vision.PoseLandmarker.create_from_options(pose_options)
+            print("✓ MediaPipe initialized successfully")
         except Exception as e:
-            raise RuntimeError(f"Failed to load sentence model: {e}")
+            raise RuntimeError(f"Failed to initialize MediaPipe: {e}")
     
-    def _load_labels(self, labels_path: str):
-        """Load class labels from file."""
-        try:
-            with open(labels_path, 'r') as f:
-                self.labels = [line.strip() for line in f.readlines()]
-            print(f"Loaded {len(self.labels)} sentence labels")
-        except Exception as e:
-            raise RuntimeError(f"Failed to load labels: {e}")
-    
-    def _extract_features(self, hand_landmarks) -> np.ndarray:
+    def extract_keypoints(self, frame: np.ndarray) -> Optional[np.ndarray]:
         """
-        Extract features from hand landmarks.
+        Extract pose and hand keypoints from frame.
         
         Args:
-            hand_landmarks: MediaPipe hand landmarks
-            
+            frame: RGB frame (H, W, 3)
+        
         Returns:
-            Feature vector as numpy array
+            Keypoint vector (258,) or None if extraction fails
         """
-        features = []
-        for landmark in hand_landmarks.landmark:
-            features.extend([landmark.x, landmark.y, landmark.z])
-        return np.array(features)
+        # Convert to MediaPipe Image
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame)
+        
+        # Extract landmarks
+        hand_result = self.hand_landmarker.detect(mp_image)
+        pose_result = self.pose_landmarker.detect(mp_image)
+        
+        # Initialize keypoint vector (33*4 + 21*3*2 = 258)
+        keypoints = np.zeros(258, dtype=np.float32)
+        
+        # Fill pose landmarks (33 landmarks × 4 values)
+        if pose_result.pose_landmarks:
+            pose_landmarks = pose_result.pose_landmarks[0]
+            for i, landmark in enumerate(pose_landmarks):
+                keypoints[i*4:(i+1)*4] = [
+                    landmark.x, landmark.y, landmark.z, landmark.visibility
+                ]
+        
+        # Fill hand landmarks (2 hands × 21 landmarks × 3 values)
+        offset = 132
+        if hand_result.hand_landmarks:
+            for hand_idx, hand_landmarks in enumerate(hand_result.hand_landmarks[:2]):
+                hand_offset = offset + hand_idx * 63
+                for i, landmark in enumerate(hand_landmarks):
+                    keypoints[hand_offset + i*3:hand_offset + (i+1)*3] = [
+                        landmark.x, landmark.y, landmark.z
+                    ]
+        
+        return keypoints
     
-    def process_frame(self, frame: np.ndarray) -> Tuple[List[Tuple[str, float]], Optional[np.ndarray]]:
+    def predict_from_buffer(self) -> Tuple[str, float]:
         """
-        Process a video frame and return ASL predictions.
+        Predict sign/sentence from current keypoint buffer.
+        
+        Returns:
+            (predicted_text, confidence)
+        """
+        if len(self.keypoint_buffer) < self.config['processing']['min_frames_for_prediction']:
+            return "", 0.0
+        
+        # Convert buffer to numpy array
+        sequence = np.array(list(self.keypoint_buffer), dtype=np.float32)
+        
+        # Add batch dimension
+        sequence_batch = np.expand_dims(sequence, axis=0)
+        
+        # Predict
+        start_time = time.time()
+        predictions = self.model.predict(sequence_batch, verbose=0)
+        inference_time = time.time() - start_time
+        
+        self.processing_times.append(inference_time)
+        
+        # Decode
+        predicted_text = greedy_decode(
+            predictions[0],
+            self.idx_to_char,
+            blank_index=self.blank_index
+        )
+        
+        # Calculate confidence (average max probability)
+        confidence = np.mean(np.max(predictions[0], axis=1))
+        
+        return predicted_text, confidence
+    
+    def update_sentence(self, prediction: str, confidence: float) -> str:
+        """
+        Update sentence based on prediction with stability checking.
         
         Args:
-            frame: Input video frame (BGR format)
-            
+            prediction: Current prediction
+            confidence: Prediction confidence
+        
         Returns:
-            Tuple of (predictions, annotated_frame)
-            predictions: List of (label, confidence) tuples sorted by confidence
-            annotated_frame: Frame with hand landmarks drawn (or None)
+            Current complete sentence
+        """
+        min_confidence = self.config['processing']['confidence_threshold']
+        pause_threshold = self.config['processing']['gesture_pause_frames']
+        
+        # Filter low confidence predictions
+        if confidence < min_confidence:
+            self.pause_counter += 1
+            if self.pause_counter > pause_threshold:
+                self.stable_prediction_count = 0
+                self.last_prediction = ""
+            return ' '.join(self.current_sentence)
+        
+        # Reset pause counter
+        self.pause_counter = 0
+        
+        # Check prediction stability
+        if prediction == self.last_prediction and prediction:
+            self.stable_prediction_count += 1
+        else:
+            self.stable_prediction_count = 1
+            self.last_prediction = prediction
+        
+        # Add to sentence if stable and not already present
+        if self.stable_prediction_count >= 5:  # Stable for 5 frames
+            if prediction and (not self.current_sentence or 
+                              self.current_sentence[-1] != prediction):
+                self.current_sentence.append(prediction)
+                self.stable_prediction_count = 0
+                self.total_predictions += 1
+        
+        return ' '.join(self.current_sentence)
+    
+    def reset_sentence(self):
+        """Reset current sentence."""
+        self.current_sentence = []
+        self.last_prediction = ""
+        self.stable_prediction_count = 0
+        self.pause_counter = 0
+        self.keypoint_buffer.clear()
+    
+    def process_frame(self, frame: np.ndarray) -> Tuple[str, str, float, dict]:
+        """
+        Process single frame: extract keypoints, predict, update sentence.
+        
+        Args:
+            frame: BGR frame from webcam
+        
+        Returns:
+            (current_prediction, sentence, confidence, stats)
         """
         # Convert BGR to RGB
-        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         
-        # Process frame with MediaPipe
-        results = self.hands.process(rgb_frame)
+        # Extract keypoints
+        keypoints = self.extract_keypoints(frame_rgb)
         
-        predictions = []
-        annotated_frame = frame.copy()
+        # Add to buffer
+        if keypoints is not None:
+            self.keypoint_buffer.append(keypoints)
         
-        if results.multi_hand_landmarks:
-            for hand_landmarks in results.multi_hand_landmarks:
-                # Draw landmarks on frame
-                self.mp_draw.draw_landmarks(
-                    annotated_frame,
-                    hand_landmarks,
-                    self.mp_hands.HAND_CONNECTIONS
-                )
-                
-                # Extract features
-                features = self._extract_features(hand_landmarks)
-                
-                # Reshape for model input
-                features = features.reshape(1, -1)
-                
-                # Get predictions from model
-                if self.model:
-                    model_predictions = self.model.predict(features, verbose=0)
-                    
-                    # Get top predictions
-                    top_indices = np.argsort(model_predictions[0])[::-1][:5]
-                    
-                    for idx in top_indices:
-                        label = self.labels[idx] if idx < len(self.labels) else f"Unknown_{idx}"
-                        confidence = float(model_predictions[0][idx])
-                        
-                        if confidence >= self.confidence_threshold:
-                            predictions.append((label, confidence))
+        # Predict if buffer is sufficient
+        prediction, confidence = self.predict_from_buffer()
         
-        return predictions, annotated_frame
+        # Update sentence
+        sentence = self.update_sentence(prediction, confidence)
+        
+        # Update FPS
+        self.frame_count += 1
+        elapsed = time.time() - self.start_time
+        if elapsed > 1.0:
+            self.fps = self.frame_count / elapsed
+            self.frame_count = 0
+            self.start_time = time.time()
+        
+        # Statistics
+        stats = {
+            'fps': round(self.fps, 1),
+            'buffer_size': len(self.keypoint_buffer),
+            'confidence': round(confidence, 3),
+            'total_predictions': self.total_predictions,
+            'avg_inference_time': round(np.mean(self.processing_times) * 1000, 1) if self.processing_times else 0
+        }
+        
+        return prediction, sentence, confidence, stats
+    
+    def draw_info(self, frame: np.ndarray, prediction: str, sentence: str, 
+                  confidence: float, stats: dict) -> np.ndarray:
+        """
+        Draw information overlay on frame.
+        
+        Args:
+            frame: Input frame
+            prediction: Current prediction
+            sentence: Complete sentence
+            confidence: Prediction confidence
+            stats: Statistics dictionary
+        
+        Returns:
+            Frame with overlay
+        """
+        h, w = frame.shape[:2]
+        overlay = frame.copy()
+        
+        # Semi-transparent background for text
+        cv2.rectangle(overlay, (0, 0), (w, 150), (0, 0, 0), -1)
+        cv2.addWeighted(overlay, 0.4, frame, 0.6, 0, frame)
+        
+        # Current prediction
+        cv2.putText(frame, f"Current: {prediction}", (10, 30),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+        
+        # Sentence
+        cv2.putText(frame, f"Sentence: {sentence}", (10, 70),
+                   cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
+        
+        # Confidence bar
+        bar_width = int(confidence * 200)
+        cv2.rectangle(frame, (10, 90), (210, 110), (50, 50, 50), -1)
+        color = (0, 255, 0) if confidence > 0.5 else (0, 165, 255)
+        cv2.rectangle(frame, (10, 90), (10 + bar_width, 110), color, -1)
+        cv2.putText(frame, f"{confidence:.2f}", (220, 105),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        
+        # Stats
+        stats_text = (
+            f"FPS: {stats['fps']} | "
+            f"Buffer: {stats['buffer_size']} | "
+            f"Inference: {stats['avg_inference_time']}ms"
+        )
+        cv2.putText(frame, stats_text, (10, 135),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+        
+        return frame
     
     def cleanup(self):
         """Cleanup resources."""
-        if self.hands:
-            self.hands.close()
+        if hasattr(self, 'hand_landmarker'):
+            self.hand_landmarker.close()
+        if hasattr(self, 'pose_landmarker'):
+            self.pose_landmarker.close()
 
 
-class RealtimeAlphabetEngine:
+class WebcamCapture:
     """
-    Alphabet-level ASL recognition engine.
-    Recognizes individual ASL letters (fingerspelling).
+    Webcam capture utility with frame skipping.
     """
     
-    def __init__(self, model_path: str, labels_path: str, confidence_threshold: float = 0.6):
+    def __init__(self, camera_id: int = 0, width: int = 640, height: int = 480,
+                 frame_skip: int = 2):
         """
-        Initialize the alphabet-level ASL recognition engine.
+        Initialize webcam capture.
         
         Args:
-            model_path: Path to the trained TensorFlow model (.h5 file)
-            labels_path: Path to the labels file (.txt file)
-            confidence_threshold: Minimum confidence threshold for predictions
+            camera_id: Camera device ID
+            width: Frame width
+            height: Frame height
+            frame_skip: Process every nth frame
         """
-        self.confidence_threshold = confidence_threshold
-        self.model = None
-        self.labels = []
+        self.cap = cv2.VideoCapture(camera_id)
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+        self.frame_skip = frame_skip
+        self.frame_count = 0
         
-        # Initialize MediaPipe Hands
-        self.mp_hands = mp.solutions.hands
-        self.hands = self.mp_hands.Hands(
-            static_image_mode=False,
-            max_num_hands=1,  # Alphabet typically uses one hand
-            min_detection_confidence=0.7,  # Higher threshold for letters
-            min_tracking_confidence=0.7
-        )
-        self.mp_draw = mp.solutions.drawing_utils
-        
-        # Load model and labels
-        self._load_model(model_path)
-        self._load_labels(labels_path)
+        if not self.cap.isOpened():
+            raise RuntimeError(f"Could not open camera {camera_id}")
     
-    def _load_model(self, model_path: str):
-        """Load the TensorFlow model."""
-        try:
-            self.model = tf.keras.models.load_model(model_path)
-            print(f"Alphabet model loaded from {model_path}")
-        except Exception as e:
-            raise RuntimeError(f"Failed to load alphabet model: {e}")
-    
-    def _load_labels(self, labels_path: str):
-        """Load class labels from file."""
-        try:
-            with open(labels_path, 'r') as f:
-                self.labels = [line.strip() for line in f.readlines()]
-            print(f"Loaded {len(self.labels)} alphabet labels")
-        except Exception as e:
-            raise RuntimeError(f"Failed to load labels: {e}")
-    
-    def _extract_features(self, hand_landmarks) -> np.ndarray:
+    def read(self) -> Tuple[bool, Optional[np.ndarray]]:
         """
-        Extract features from hand landmarks for alphabet recognition.
+        Read frame with skipping.
         
-        Args:
-            hand_landmarks: MediaPipe hand landmarks
-            
         Returns:
-            Feature vector as numpy array
+            (should_process, frame)
         """
-        features = []
+        ret, frame = self.cap.read()
         
-        # Extract raw coordinates
-        for landmark in hand_landmarks.landmark:
-            features.extend([landmark.x, landmark.y, landmark.z])
+        if not ret:
+            return False, None
         
-        # Add relative angles and distances (helps with alphabet recognition)
-        landmarks_array = np.array([[lm.x, lm.y, lm.z] for lm in hand_landmarks.landmark])
+        self.frame_count += 1
         
-        # Calculate distances between fingertips and palm
-        palm_center = landmarks_array[0]  # Wrist as reference
-        for tip_idx in [4, 8, 12, 16, 20]:  # Thumb, Index, Middle, Ring, Pinky tips
-            distance = np.linalg.norm(landmarks_array[tip_idx] - palm_center)
-            features.append(distance)
+        # Skip frames for performance
+        should_process = (self.frame_count % self.frame_skip == 0)
         
-        return np.array(features)
+        return should_process, frame
     
-    def process_frame(self, frame: np.ndarray) -> Tuple[List[Tuple[str, float]], Optional[np.ndarray]]:
-        """
-        Process a video frame and return alphabet predictions.
-        
-        Args:
-            frame: Input video frame (BGR format)
+    def release(self):
+        """Release camera."""
+        self.cap.release()
+
+
+if __name__ == "__main__":
+    """
+    Standalone test of real-time engine.
+    """
+    import json
+    
+    # Load configuration
+    with open('realtime_config.json', 'r') as f:
+        config = json.load(f)
+    
+    # Initialize engine
+    engine = RealtimeASLEngine(
+        config=config,
+        model_path=config['model']['model_path'],
+        char_map_path=config['model']['char_map_path']
+    )
+    
+    # Initialize webcam
+    webcam = WebcamCapture(
+        camera_id=config['webcam']['camera_id'],
+        width=config['webcam']['width'],
+        height=config['webcam']['height'],
+        frame_skip=config['processing']['frame_skip']
+    )
+    
+    print("\n" + "=" * 60)
+    print("Real-time ASL Recognition - Standalone Test")
+    print("=" * 60)
+    print("Controls:")
+    print("  Press 'r' to reset sentence")
+    print("  Press 'q' to quit")
+    print("=" * 60 + "\n")
+    
+    try:
+        while True:
+            should_process, frame = webcam.read()
             
-        Returns:
-            Tuple of (predictions, annotated_frame)
-            predictions: List of (label, confidence) tuples sorted by confidence
-            annotated_frame: Frame with hand landmarks drawn (or None)
-        """
-        # Convert BGR to RGB
-        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        
-        # Process frame with MediaPipe
-        results = self.hands.process(rgb_frame)
-        
-        predictions = []
-        annotated_frame = frame.copy()
-        
-        if results.multi_hand_landmarks:
-            for hand_landmarks in results.multi_hand_landmarks:
-                # Draw landmarks on frame
-                self.mp_draw.draw_landmarks(
-                    annotated_frame,
-                    hand_landmarks,
-                    self.mp_hands.HAND_CONNECTIONS,
-                    self.mp_draw.DrawingSpec(color=(0, 255, 0), thickness=2, circle_radius=2),
-                    self.mp_draw.DrawingSpec(color=(255, 0, 0), thickness=2)
-                )
+            if frame is None:
+                break
+            
+            if should_process:
+                # Process frame
+                prediction, sentence, confidence, stats = engine.process_frame(frame)
                 
-                # Extract features
-                features = self._extract_features(hand_landmarks)
-                
-                # Reshape for model input
-                features = features.reshape(1, -1)
-                
-                # Get predictions from model
-                if self.model:
-                    model_predictions = self.model.predict(features, verbose=0)
-                    
-                    # Get top predictions
-                    top_indices = np.argsort(model_predictions[0])[::-1][:3]
-                    
-                    for idx in top_indices:
-                        label = self.labels[idx] if idx < len(self.labels) else f"Unknown_{idx}"
-                        confidence = float(model_predictions[0][idx])
-                        
-                        if confidence >= self.confidence_threshold:
-                            predictions.append((label, confidence))
-                
-                # Add prediction overlay
-                if predictions:
-                    top_label, top_conf = predictions[0]
-                    cv2.putText(
-                        annotated_frame,
-                        f"{top_label}: {top_conf:.2f}",
-                        (10, 100),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        1.5,
-                        (0, 255, 0),
-                        3
-                    )
-        
-        return predictions, annotated_frame
+                # Draw overlay
+                frame = engine.draw_info(frame, prediction, sentence, confidence, stats)
+            
+            # Display
+            cv2.imshow('ASL Recognition', frame)
+            
+            # Handle keys
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
+                break
+            elif key == ord('r'):
+                engine.reset_sentence()
+                print("Sentence reset")
     
-    def cleanup(self):
-        """Cleanup resources."""
-        if self.hands:
-            self.hands.close()
+    finally:
+        webcam.release()
+        cv2.destroyAllWindows()
+        engine.cleanup()
+        print("\nEngine stopped")
